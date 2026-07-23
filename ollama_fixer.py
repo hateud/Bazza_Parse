@@ -42,7 +42,7 @@ DEFAULT_CONFIG = {
     "ollama": {
         "enabled": False,
         "host": "http://localhost:11434",
-        "model": "qwen2.5:7b-instruct",
+        "model": "qwen3:8b",
         "timeout_seconds": 120,
     },
     "selectors": {
@@ -109,7 +109,7 @@ def _ollama_chat(cfg: dict, system_prompt: str, user_prompt: str) -> str:
     """
     ollama = cfg.get("ollama", {})
     host = ollama.get("host", "http://localhost:11434").rstrip("/")
-    model = ollama.get("model", "qwen2.5:7b-instruct")
+    model = ollama.get("model", "qwen3:8b")
     timeout = ollama.get("timeout_seconds", 120)
 
     payload = {
@@ -218,19 +218,16 @@ def _sanitize_patch(patch: dict, allowed_keys) -> dict:
     return clean
 
 
-def self_heal_selectors(page, cfg: dict, street: str, house: str) -> bool:
-    """Пытается починить селекторы через Ollama и записать их в config.json.
+def _heal(page, cfg: dict, street: str, house: str, situation: str) -> bool:
+    """Общий движок самолечения: снимает слепок страницы, спрашивает модель
+    (situation — короткое описание проблемы для промпта), проверяет ответ и
+    пишет исправленные селекторы в config.json.
 
     Возвращает True, если конфиг был обновлён (тогда вызывающий код должен
     перечитать селекторы в память). Любая ошибка (Ollama недоступна, ответ
-    не разобран и т.п.) — это просто False и сообщение в консоль, поиск при
-    этом продолжается как обычно на прежних значениях.
+    не разобран и т.п.) — это просто False и сообщение в консоль; работа
+    продолжается как обычно на прежних значениях.
     """
-    if not is_enabled(cfg):
-        return False
-
-    print("    [ollama] Поиск не дошёл до подсказки — спрашиваю модель, что починить ...")
-
     try:
         diag = collect_diagnostics(page, cfg, street, house)
     except Exception as e:
@@ -238,10 +235,11 @@ def self_heal_selectors(page, cfg: dict, street: str, house: str) -> bool:
         return False
 
     user_prompt = (
-        "Скрапер не смог найти подсказку адреса на странице поиска. "
+        situation + " "
         "Ниже слепок страницы в JSON. Поле current_selectors — это то, что "
         "скрапер сейчас ищет; placeholders_on_page и visible_text_excerpt — "
-        "что реально есть на странице. Верни JSON с исправленными селекторами.\n\n"
+        "что реально есть на странице. Верни JSON с исправленными селекторами "
+        "(или пустой объект {}, если чинить нечего).\n\n"
         + json.dumps(diag, ensure_ascii=False, indent=2)
     )
 
@@ -283,3 +281,45 @@ def self_heal_selectors(page, cfg: dict, street: str, house: str) -> bool:
     for key, value in clean.items():
         print(f"        {key} = {value!r}")
     return True
+
+
+def self_heal_selectors(page, cfg: dict, street: str, house: str) -> bool:
+    """Самолечение, когда поиск не смог найти подсказку адреса (селектор
+    поля/подсказки разъехался)."""
+    if not is_enabled(cfg):
+        return False
+
+    print("    [ollama] Поиск не дошёл до подсказки — спрашиваю модель, что починить ...")
+    return _heal(
+        page, cfg, street, house,
+        "Скрапер не смог найти подсказку адреса на странице поиска.",
+    )
+
+
+def diagnose_no_results(page, cfg: dict, street: str, house: str,
+                        count_was_none: bool) -> bool:
+    """Самолечение, когда адрес введён и 'Найти' нажата, но результата нет.
+
+    count_was_none=True — счётчик 'Найдено: N' вообще не удалось прочитать
+    (вероятно, разъехался селектор found_count_regex или кнопка). Модель
+    смотрит на страницу: если счётчик/кнопка на месте, но селектор с ними
+    не совпадает — чинит его; если объявлений по адресу действительно нет —
+    возвращает {} (тогда вызывающий код просто логирует и пропускает, без
+    ложной ссылки).
+    """
+    if not is_enabled(cfg):
+        return False
+
+    reason = ("счётчик результатов не удалось прочитать"
+              if count_was_none else "счётчик показал 0 результатов")
+    print(f"    [ollama] Адрес введён, но {reason} — спрашиваю модель, в чём дело ...")
+
+    situation = (
+        f"Скрапер успешно ввёл адрес и нажал кнопку поиска, но не увидел нужного "
+        f"результата ({reason}). В current_selectors: found_count_regex — регулярка "
+        f"для счётчика вида 'Найдено: N', find_button_text — текст кнопки поиска. "
+        f"Если по visible_text_excerpt счётчик результатов на странице ЕСТЬ, но "
+        f"регулярка/селектор с ним не совпадают — верни исправленные селекторы. "
+        f"Если объявлений по этому адресу действительно нет — верни пустой объект {{}}."
+    )
+    return _heal(page, cfg, street, house, situation)

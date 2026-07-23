@@ -7,7 +7,7 @@
 #      официальный .zip с сайта и распаковывает в /Applications).
 #   2. Поднимает локальный сервер Ollama (http://localhost:11434), если он
 #      ещё не запущен.
-#   3. Скачивает модель qwen2.5:7b-instruct.
+#   3. Скачивает модель qwen3:8b (см. выбор модели в README).
 #   4. Включает Ollama-режим в config.json рядом со скриптом.
 #
 # Использование:
@@ -21,7 +21,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-MODEL="qwen2.5:7b-instruct"
+# Модель по умолчанию. Можно поменять на любую из ollama.com/library —
+# см. таблицу выбора модели в README (раздел "Ollama-режим").
+MODEL="qwen3:8b"
 OLLAMA_HOST="http://localhost:11434"
 
 # ---------------------------------------------------------------------------

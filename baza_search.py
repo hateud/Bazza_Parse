@@ -176,8 +176,29 @@ def strip_street_type(street: str) -> str:
 
 
 def load_addresses(path: str):
+    """Читает адреса из первого столбца xlsx и убирает дубликаты.
+
+    Дубликаты сравниваются по нормализованному ключу (регистр не важен,
+    лишние пробелы схлопнуты) — так "Беловежская  улица, дом 21" и
+    "беловежская улица, дом 21" считаются одним адресом. Порядок
+    сохраняется, остаётся ПЕРВОЕ вхождение в исходном виде.
+    """
     df = pd.read_excel(path, header=None)
-    addresses = [str(v).strip() for v in df.iloc[:, 0].tolist() if str(v).strip()]
+    raw_addresses = [str(v).strip() for v in df.iloc[:, 0].tolist() if str(v).strip()]
+
+    seen = set()
+    addresses = []
+    for addr in raw_addresses:
+        key = re.sub(r"\s+", " ", addr).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append(addr)
+
+    removed = len(raw_addresses) - len(addresses)
+    if removed:
+        print(f"    Убрано дубликатов: {removed} (осталось уникальных адресов: {len(addresses)})")
+
     return addresses
 
 
@@ -458,6 +479,36 @@ def _select_top_suggestion(page, address_input, typed_value: str) -> bool:
             return False
 
 
+def _house_matches(final_value: str, street_value: str, requested_house: str) -> bool:
+    """Проверяет, что после выбора подсказки в поле оказался ИМЕННО
+    запрошенный дом, а не подставленный сайтом ближайший.
+
+    Зачем это нужно: подсказку по дому мы выбираем "вслепую" — берём
+    самую верхнюю (см. _select_top_suggestion), потому что искать нужную
+    строку по тексту в DOM для домов ненадёжно (частые номера вроде "2",
+    "10" совпадают с ценами и прочим текстом на странице). Но если
+    запрошенного дома в списке нет, сайт подставляет ближайший/первый
+    (например, на "169" по проспекту Мира выбирался дом 183) — и мы молча
+    отдавали ссылку на ЧУЖОЙ дом.
+
+    Сверяем по цифровым группам: все числа из запрошенного дома ("28к3"
+    -> ["28", "3"]) должны присутствовать среди чисел, которые дом
+    добавил в поле. Числа, которые уже были в названии улицы ("1-я
+    Тверская"), исключаем, чтобы они не засчитались за номер дома.
+    """
+    requested_groups = re.findall(r"\d+", requested_house)
+    if not requested_groups:
+        return True
+
+    street_groups = re.findall(r"\d+", street_value)
+    house_groups = re.findall(r"\d+", final_value)
+    for g in street_groups:
+        if g in house_groups:
+            house_groups.remove(g)
+
+    return all(g in house_groups for g in requested_groups)
+
+
 def click_search_button(page):
     """Нажимает кнопку 'Найти' справа от формы параметров."""
     find_btn = page.get_by_text(SEL["find_button_text"], exact=True).first
@@ -465,9 +516,68 @@ def click_search_button(page):
 
 
 def read_found_count(page):
-    """Читает счётчик 'Найдено: N' и возвращает N."""
-    found_text = page.locator(f'text=/{SEL["found_count_regex"]}/').first.inner_text()
-    return int(re.search(r"\d+", found_text).group())
+    """Читает счётчик 'Найдено: N'. Возвращает N (int) или None, если
+    счётчик на странице прочитать не удалось — селектор мог разъехаться,
+    либо сайт показывает результат иначе. None и 0 — разные вещи: 0 значит
+    "счётчик прочитан, объявлений нет", None значит "счётчик не прочитан"."""
+    try:
+        found_text = page.locator(f'text=/{SEL["found_count_regex"]}/').first.inner_text(timeout=2000)
+    except Exception:
+        return None
+    m = re.search(r"\d+", found_text)
+    return int(m.group()) if m else None
+
+
+# Флаг на весь прогон: стал True, когда модель уже посмотрела на "честный 0"
+# и не нашла, что чинить (селектор счётчика в порядке, объявлений просто нет).
+# После этого не дёргаем модель на каждый следующий нулевой адрес — иначе
+# на списке с многими "не найдено" прогон встанет из-за запросов к LLM.
+_counter_verified = False
+
+
+def read_count_with_diagnosis(page, street, house):
+    """Читает счётчик результатов после нажатия 'Найти'. Если результата
+    нет (счётчик 0 или не прочитан вовсе) и включён Ollama-режим — просит
+    модель разобраться:
+
+    - если это разъехавшийся селектор (found_count_regex / кнопка), модель
+      чинит config.json, после чего счётчик перечитывается;
+    - если объявлений по адресу реально нет — пишем в лог и пропускаем.
+
+    Ложных ссылок не добавляем: при непрочитанном счётчике возвращаем 0,
+    так что вызывающий код ссылку не берёт.
+    """
+    global _counter_verified
+    count = read_found_count(page)
+
+    if count is not None and count > 0:
+        return count
+
+    # Результата нет. Зовём модель, если режим включён и это либо
+    # непрочитанный счётчик (возможен разъехавшийся селектор), либо первый
+    # "честный 0" за прогон (дальше уже доверяем, что ноль настоящий).
+    if ollama_fixer.is_enabled(CONFIG) and (count is None or not _counter_verified):
+        try:
+            healed = ollama_fixer.diagnose_no_results(
+                page, CONFIG, street, house, count_was_none=(count is None)
+            )
+        except Exception as e:
+            print(f"    [ollama] Диагностика результата не сработала: {e}")
+            healed = False
+
+        if healed:
+            reload_config()
+            count = read_found_count(page)
+        elif count == 0:
+            # Модель посмотрела и чинить нечего — значит ноль настоящий.
+            _counter_verified = True
+
+    if count is None:
+        print("    Счётчик результатов прочитать не удалось — пропускаю адрес, ссылку не добавляю.")
+        return 0
+    if count == 0:
+        print("    По адресу ничего не найдено — пропускаю, ссылку не добавляю.")
+    return count
 
 
 def search_address(page, street: str, house: str):
@@ -552,7 +662,7 @@ def search_address(page, street: str, house: str):
         # Дома нет — сразу жмём 'Найти'
         click_search_button(page)
         page.wait_for_timeout(1200)
-        return True, False, read_found_count(page)
+        return True, False, read_count_with_diagnosis(page, street, house)
 
     # Шаг 3: кликаем по полю и вводим номер дома
     address_input.click(force=True)
@@ -568,12 +678,21 @@ def search_address(page, street: str, house: str):
     if not _select_top_suggestion(page, address_input, value_before_house + house):
         return True, False, 0
 
+    # Проверяем, что выбралась подсказка именно с нужным домом. Если сайт
+    # подставил другой (ближайший) дом — НЕ жмём 'Найти' и возвращаем 0,
+    # чтобы не отдать ссылку на чужой дом (см. _house_matches).
+    final_value = address_input.input_value()
+    if not _house_matches(final_value, value_before_house, house):
+        print(f"    Дом '{house}' не выбрался точно (в поле: '{final_value.strip()}') — "
+              "пропускаю, чтобы не взять ссылку на другой дом.")
+        return True, False, 0
+
     human_delay(300, 700)
 
     # Шаг 5: и только теперь — кнопка 'Найти'
     click_search_button(page)
     page.wait_for_timeout(1200)
-    return True, True, read_found_count(page)
+    return True, True, read_count_with_diagnosis(page, street, house)
 
 
 def get_share_link(page):
@@ -656,6 +775,13 @@ def process_file(page, in_path: Path, out_path: Path):
                 link = ""
                 if count > 0:
                     link = get_share_link(page) or ""
+
+                # Дом был указан, но точную подсказку по нему выбрать не
+                # удалось (search_address намеренно вернул 0, чтобы не
+                # взять ссылку на другой дом) — помечаем строку, чтобы её
+                # проверили вручную, а не приняли за "0 вариантов".
+                if house and not house_ok:
+                    link = link or "дом не подобран точно — проверьте вручную"
 
                 print(f"    Найдено: {count} вариантов. Ссылка: {link or '—'}")
                 writer.writerow([raw_address, count, link])
