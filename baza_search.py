@@ -41,14 +41,29 @@ from pathlib import Path
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-SEARCH_URL = "https://w7.baza-winner.ru/search/new/sell-msk-flat"
+import ollama_fixer
+
 PROFILE_DIR = Path(__file__).parent / ".browser_profile"
 INPUT_DIR = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
 INPUT_EXTENSIONS = (".xlsx", ".xls")
 
-ADDRESS_INPUT_PLACEHOLDER = "Город, район, адрес, метро, название ЖК"
+# Конфиг с "чинибельными" селекторами (см. ollama_fixer). Загружается один
+# раз при старте; SEL — короткая ссылка на секцию selectors. После
+# самолечения через Ollama конфиг перечитывается функцией reload_config(),
+# и SEL начинает указывать на обновлённые значения — поэтому в коде везде
+# читаем SEL[...] в момент вызова, а не копируем значения в отдельные
+# константы.
+CONFIG = ollama_fixer.load_config()
+SEL = CONFIG["selectors"]
+
+
+def reload_config():
+    """Перечитывает конфиг с диска в память после самолечения селекторов."""
+    global CONFIG, SEL
+    CONFIG = ollama_fixer.load_config()
+    SEL = CONFIG["selectors"]
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +194,7 @@ def ensure_logged_in(page):
 
 
 def open_search_page(page):
-    page.goto(SEARCH_URL)
+    page.goto(SEL["search_url"])
     page.wait_for_timeout(1500)
 
 
@@ -445,13 +460,13 @@ def _select_top_suggestion(page, address_input, typed_value: str) -> bool:
 
 def click_search_button(page):
     """Нажимает кнопку 'Найти' справа от формы параметров."""
-    find_btn = page.get_by_text("Найти", exact=True).first
+    find_btn = page.get_by_text(SEL["find_button_text"], exact=True).first
     find_btn.click(force=True)
 
 
 def read_found_count(page):
     """Читает счётчик 'Найдено: N' и возвращает N."""
-    found_text = page.locator("text=/Найдено: \\d+/").first.inner_text()
+    found_text = page.locator(f'text=/{SEL["found_count_regex"]}/').first.inner_text()
     return int(re.search(r"\d+", found_text).group())
 
 
@@ -472,7 +487,7 @@ def search_address(page, street: str, house: str):
     # так что печатать его самим не нужно.
     search_street = strip_street_type(street)
 
-    address_input = page.get_by_role("textbox", name=ADDRESS_INPUT_PLACEHOLDER)
+    address_input = page.get_by_role("textbox", name=SEL["address_input_placeholder"])
     address_input.click(force=True)
     human_delay()
 
@@ -512,6 +527,16 @@ def search_address(page, street: str, house: str):
             search_street = street
 
     if not found:
+        # Дошли до этой точки — значит поиск не смог даже найти подсказку
+        # улицы (текст на странице не совпал с ожидаемым селектором). Если
+        # включён Ollama-режим, отдаём слепок страницы модели: пусть
+        # определит, какой селектор разъехался, и запишет исправление в
+        # config.json. Обновлённые значения подхватятся со следующего адреса.
+        try:
+            if ollama_fixer.self_heal_selectors(page, CONFIG, street, house):
+                reload_config()
+        except Exception as e:
+            print(f"    [ollama] Самолечение не сработало: {e}")
         return False, False, 0
 
     for _ in range(offset):
@@ -571,10 +596,10 @@ def get_share_link(page):
     shadow-корни. А значение читаем через .input_value() — это реальное
     свойство .value элемента, а не HTML-атрибут.
     """
-    page.get_by_text("Список", exact=True).click(force=True)
+    page.get_by_text(SEL["list_tab_text"], exact=True).click(force=True)
     page.wait_for_timeout(800)
 
-    share_icon = page.locator('iron-icon[icon="social:share"]').first
+    share_icon = page.locator(SEL["share_icon_selector"]).first
     try:
         share_icon.click(force=True, timeout=4000)
     except PWTimeout:
@@ -591,7 +616,7 @@ def get_share_link(page):
                 value = candidate.input_value(timeout=500)
             except Exception:
                 continue
-            if value and value.startswith("https://online.baza-winner.ru"):
+            if value and value.startswith(SEL["share_link_prefix"]):
                 return value
         page.wait_for_timeout(300)
 
@@ -650,7 +675,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", help="xlsx-файл со списком адресов (необязательно)")
     parser.add_argument("--output", help="куда сохранить результаты (необязательно)")
+    parser.add_argument(
+        "--ollama",
+        action="store_true",
+        help="включить Ollama-режим самолечения селекторов на этот запуск "
+        "(по умолчанию берётся из config.json)",
+    )
     args = parser.parse_args()
+
+    # Флаг командной строки включает Ollama-режим поверх config.json на
+    # текущий запуск — удобно, если не хочется трогать конфиг.
+    if args.ollama:
+        CONFIG.setdefault("ollama", {})["enabled"] = True
+
+    if ollama_fixer.is_enabled(CONFIG):
+        print(f">>> Ollama-режим ВКЛЮЧЁН (модель: {CONFIG['ollama'].get('model')}). "
+              "При провале поиска селекторы будут чиниться автоматически.")
+    else:
+        print(">>> Ollama-режим выключен. Включить: ./setup_ollama.sh или флаг --ollama.")
 
     ensure_dirs()
 
