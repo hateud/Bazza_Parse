@@ -516,9 +516,68 @@ def click_search_button(page):
 
 
 def read_found_count(page):
-    """Читает счётчик 'Найдено: N' и возвращает N."""
-    found_text = page.locator(f'text=/{SEL["found_count_regex"]}/').first.inner_text()
-    return int(re.search(r"\d+", found_text).group())
+    """Читает счётчик 'Найдено: N'. Возвращает N (int) или None, если
+    счётчик на странице прочитать не удалось — селектор мог разъехаться,
+    либо сайт показывает результат иначе. None и 0 — разные вещи: 0 значит
+    "счётчик прочитан, объявлений нет", None значит "счётчик не прочитан"."""
+    try:
+        found_text = page.locator(f'text=/{SEL["found_count_regex"]}/').first.inner_text(timeout=2000)
+    except Exception:
+        return None
+    m = re.search(r"\d+", found_text)
+    return int(m.group()) if m else None
+
+
+# Флаг на весь прогон: стал True, когда модель уже посмотрела на "честный 0"
+# и не нашла, что чинить (селектор счётчика в порядке, объявлений просто нет).
+# После этого не дёргаем модель на каждый следующий нулевой адрес — иначе
+# на списке с многими "не найдено" прогон встанет из-за запросов к LLM.
+_counter_verified = False
+
+
+def read_count_with_diagnosis(page, street, house):
+    """Читает счётчик результатов после нажатия 'Найти'. Если результата
+    нет (счётчик 0 или не прочитан вовсе) и включён Ollama-режим — просит
+    модель разобраться:
+
+    - если это разъехавшийся селектор (found_count_regex / кнопка), модель
+      чинит config.json, после чего счётчик перечитывается;
+    - если объявлений по адресу реально нет — пишем в лог и пропускаем.
+
+    Ложных ссылок не добавляем: при непрочитанном счётчике возвращаем 0,
+    так что вызывающий код ссылку не берёт.
+    """
+    global _counter_verified
+    count = read_found_count(page)
+
+    if count is not None and count > 0:
+        return count
+
+    # Результата нет. Зовём модель, если режим включён и это либо
+    # непрочитанный счётчик (возможен разъехавшийся селектор), либо первый
+    # "честный 0" за прогон (дальше уже доверяем, что ноль настоящий).
+    if ollama_fixer.is_enabled(CONFIG) and (count is None or not _counter_verified):
+        try:
+            healed = ollama_fixer.diagnose_no_results(
+                page, CONFIG, street, house, count_was_none=(count is None)
+            )
+        except Exception as e:
+            print(f"    [ollama] Диагностика результата не сработала: {e}")
+            healed = False
+
+        if healed:
+            reload_config()
+            count = read_found_count(page)
+        elif count == 0:
+            # Модель посмотрела и чинить нечего — значит ноль настоящий.
+            _counter_verified = True
+
+    if count is None:
+        print("    Счётчик результатов прочитать не удалось — пропускаю адрес, ссылку не добавляю.")
+        return 0
+    if count == 0:
+        print("    По адресу ничего не найдено — пропускаю, ссылку не добавляю.")
+    return count
 
 
 def search_address(page, street: str, house: str):
@@ -603,7 +662,7 @@ def search_address(page, street: str, house: str):
         # Дома нет — сразу жмём 'Найти'
         click_search_button(page)
         page.wait_for_timeout(1200)
-        return True, False, read_found_count(page)
+        return True, False, read_count_with_diagnosis(page, street, house)
 
     # Шаг 3: кликаем по полю и вводим номер дома
     address_input.click(force=True)
@@ -633,7 +692,7 @@ def search_address(page, street: str, house: str):
     # Шаг 5: и только теперь — кнопка 'Найти'
     click_search_button(page)
     page.wait_for_timeout(1200)
-    return True, True, read_found_count(page)
+    return True, True, read_count_with_diagnosis(page, street, house)
 
 
 def get_share_link(page):
