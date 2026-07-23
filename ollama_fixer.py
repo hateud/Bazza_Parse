@@ -42,7 +42,7 @@ DEFAULT_CONFIG = {
     "ollama": {
         "enabled": False,
         "host": "http://localhost:11434",
-        "model": "qwen2.5:7b-instruct",
+        "model": "qwen3:8b",
         "timeout_seconds": 120,
     },
     "selectors": {
@@ -109,7 +109,7 @@ def _ollama_chat(cfg: dict, system_prompt: str, user_prompt: str) -> str:
     """
     ollama = cfg.get("ollama", {})
     host = ollama.get("host", "http://localhost:11434").rstrip("/")
-    model = ollama.get("model", "qwen2.5:7b-instruct")
+    model = ollama.get("model", "qwen3:8b")
     timeout = ollama.get("timeout_seconds", 120)
 
     payload = {
